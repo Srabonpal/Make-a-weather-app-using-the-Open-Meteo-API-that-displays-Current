@@ -1,0 +1,389 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:intl/intl.dart';
+
+void main() {
+  runApp(const WeatherApp());
+}
+
+class WeatherApp extends StatelessWidget {
+  const WeatherApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Open-Meteo Weather (Asia/Dhaka)',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const WeatherScreen(),
+    );
+  }
+}
+
+enum LoadState { idle, loading, success, error }
+
+class WeatherScreen extends StatefulWidget {
+  const WeatherScreen({super.key});
+
+  @override
+  State<WeatherScreen> createState() => _WeatherScreenState();
+}
+
+class _WeatherScreenState extends State<WeatherScreen> {
+  final TextEditingController _latController = TextEditingController(text: "23.8103"); // Dhaka default
+  final TextEditingController _lonController = TextEditingController(text: "90.4125"); // Dhaka default
+
+  LoadState _state = LoadState.idle;
+  String? _errorMessage;
+  Map<String, dynamic>? _data;
+
+  // Open-Meteo endpoint (timezone Asia/Dhaka)
+  String _buildUrl(double lat, double lon) {
+    final base = 'https://api.open-meteo.com/v1/forecast';
+    // we request current, hourly (temperature, weather_code, wind_speed), daily (max/min, sunrise, sunset), 10 days
+    final params = {
+      'latitude': lat.toString(),
+      'longitude': lon.toString(),
+      'current_weather': 'true',
+      'hourly': 'temperature_2m,weathercode,wind_speed_10m',
+      'daily': 'temperature_2m_max,temperature_2m_min,sunrise,sunset',
+      'forecast_days': '10',
+      'timezone': 'Asia%2FDhaka', // percent-encoded (Open-Meteo accepts either 'Asia/Dhaka' too)
+    };
+    final query = params.entries.map((e) => '${e.key}=${e.value}').join('&');
+    return '$base?$query';
+  }
+
+  Future<void> _fetchWeather() async {
+    setState(() {
+      _state = LoadState.loading;
+      _errorMessage = null;
+      _data = null;
+    });
+
+    final latText = _latController.text.trim();
+    final lonText = _lonController.text.trim();
+
+    double? lat = double.tryParse(latText);
+    double? lon = double.tryParse(lonText);
+
+    if (lat == null || lon == null) {
+      setState(() {
+        _state = LoadState.error;
+        _errorMessage = 'Latitude and Longitude must be valid numbers.';
+      });
+      return;
+    }
+
+    final url = _buildUrl(lat, lon);
+
+    try {
+      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 15));
+      if (resp.statusCode != 200) {
+        setState(() {
+          _state = LoadState.error;
+          _errorMessage = 'Server returned status ${resp.statusCode}';
+        });
+        return;
+      }
+      final jsonData = json.decode(resp.body) as Map<String, dynamic>;
+
+      // Basic response validation
+      if (!jsonData.containsKey('current_weather') && !jsonData.containsKey('hourly') && !jsonData.containsKey('daily')) {
+        setState(() {
+          _state = LoadState.error;
+          _errorMessage = 'Unexpected API response structure.';
+        });
+        return;
+      }
+
+      setState(() {
+        _state = LoadState.success;
+        _data = jsonData;
+      });
+    } catch (e) {
+      setState(() {
+        _state = LoadState.error;
+        _errorMessage = 'Failed to fetch weather: $e';
+      });
+    }
+  }
+
+  // helper to convert weather code to description (Open-Meteo codes)
+  String _weatherDescription(int code) {
+    // simplified mapping
+    if (code == 0) return 'Clear sky';
+    if (code == 1 || code == 2 || code == 3) return 'Mainly clear / partly cloudy';
+    if (code == 45 || code == 48) return 'Fog / depositing rime fog';
+    if (code == 51 || code == 53 || code == 55) return 'Drizzle';
+    if (code == 61 || code == 63 || code == 65) return 'Rain';
+    if (code == 66 || code == 67) return 'Freezing rain';
+    if (code == 71 || code == 73 || code == 75) return 'Snow fall';
+    if (code == 80 || code == 81 || code == 82) return 'Rain showers';
+    if (code == 85 || code == 86) return 'Snow showers';
+    if (code == 95 || code == 96 || code == 99) return 'Thunderstorm';
+    return 'Unknown';
+  }
+
+  // pretty time format in Dhaka timezone (API returns localized times already because we requested timezone)
+  String _formatTime(String iso) {
+    try {
+      final dt = DateTime.parse(iso);
+      return DateFormat('yyyy-MM-dd HH:mm').format(dt);
+    } catch (e) {
+      return iso;
+    }
+  }
+
+  // Build Current Weather Card
+  Widget _buildCurrentCard() {
+    if (_data == null) return const SizedBox.shrink();
+    final current = _data!['current_weather'] as Map<String, dynamic>?;
+    if (current == null) return const SizedBox.shrink();
+
+    final double temperature = (current['temperature'] as num).toDouble();
+    final double wind = (current['windspeed'] as num).toDouble();
+    final int code = (current['weathercode'] as num).toInt();
+    final String time = current['time'] as String;
+
+    return Card(
+      elevation: 4,
+      child: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Current Weather', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(child: Text('${temperature.toStringAsFixed(1)} °C', style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold))),
+              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text(_weatherDescription(code)),
+                Text('Wind: ${wind.toStringAsFixed(1)} m/s'),
+                Text('Time: ${_formatTime(time)}'),
+              ]),
+            ],
+          ),
+        ]),
+      ),
+    );
+  }
+
+  // Build Hourly list (show next 24 hours)
+  Widget _buildHourlyList() {
+    if (_data == null) return const SizedBox.shrink();
+    final hourly = _data!['hourly'] as Map<String, dynamic>?;
+    if (hourly == null) return const SizedBox.shrink();
+
+    final List times = (hourly['time'] as List).cast();
+    final List temps = (hourly['temperature_2m'] as List).cast();
+    final List codes = (hourly['weathercode'] as List).cast();
+    final List winds = (hourly['wind_speed_10m'] as List).cast();
+
+    // collect up to next 24 items (from index 0)
+    final count = times.length < 24 ? times.length : 24;
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(8.0),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Hourly (next 24 hours)', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 120,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: count,
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemBuilder: (context, idx) {
+                final t = DateTime.tryParse(times[idx]) ?? DateTime.now();
+                final label = DateFormat('HH:mm').format(t);
+                final temp = (temps[idx] as num).toDouble();
+                final code = (codes[idx] as num).toInt();
+                final wind = (winds[idx] as num).toDouble();
+                return Container(
+                  width: 100,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade300),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 6),
+                    Text('${temp.toStringAsFixed(0)}°C', style: const TextStyle(fontSize: 18)),
+                    const SizedBox(height: 6),
+                    Text(_weatherDescription(code), textAlign: TextAlign.center, style: const TextStyle(fontSize: 12)),
+                    const SizedBox(height: 4),
+                    Text('W:${wind.toStringAsFixed(1)} m/s', style: const TextStyle(fontSize: 11)),
+                  ]),
+                );
+              },
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  // Build 10-day forecast
+  Widget _build10Day() {
+    if (_data == null) return const SizedBox.shrink();
+    final daily = _data!['daily'] as Map<String, dynamic>?;
+    if (daily == null) return const SizedBox.shrink();
+
+    final List times = (daily['time'] as List).cast();
+    final List tMax = (daily['temperature_2m_max'] as List).cast();
+    final List tMin = (daily['temperature_2m_min'] as List).cast();
+    final List sr = (daily['sunrise'] as List).cast();
+    final List ss = (daily['sunset'] as List).cast();
+
+    final count = times.length;
+
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('10-Day Forecast (High / Low)', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          ListView.separated(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: count,
+            separatorBuilder: (_, __) => const Divider(),
+            itemBuilder: (context, idx) {
+              final dateStr = times[idx] as String;
+              final date = DateTime.tryParse(dateStr);
+              final dayLabel = date != null ? DateFormat('EEE, MMM d').format(date) : dateStr;
+              final max = (tMax[idx] as num).toDouble();
+              final min = (tMin[idx] as num).toDouble();
+              final sunrise = sr[idx] as String;
+              final sunset = ss[idx] as String;
+              return Row(
+                children: [
+                  Expanded(child: Text(dayLabel)),
+                  Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    Text('High: ${max.toStringAsFixed(1)}°C'),
+                    Text('Low: ${min.toStringAsFixed(1)}°C'),
+                    Text('Sunrise: ${_formatTime(sunrise)}', style: const TextStyle(fontSize: 11)),
+                    Text('Sunset: ${_formatTime(sunset)}', style: const TextStyle(fontSize: 11)),
+                  ])
+                ],
+              );
+            },
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _latController.dispose();
+    _lonController.dispose();
+    super.dispose();
+  }
+
+  // Main UI
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Open-Meteo Weather (Asia/Dhaka)')),
+      body: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Column(children: [
+          // Input row
+          Row(children: [
+            Expanded(
+              child: TextField(
+                controller: _latController,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                decoration: const InputDecoration(labelText: 'Latitude', border: OutlineInputBorder()),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: TextField(
+                controller: _lonController,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                decoration: const InputDecoration(labelText: 'Longitude', border: OutlineInputBorder()),
+              ),
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton(
+              onPressed: _fetchWeather,
+              child: const Text('Fetch'),
+            ),
+          ]),
+
+          const SizedBox(height: 12),
+
+          // State indicator
+          if (_state == LoadState.idle) ...[
+            const Text('Enter latitude & longitude and press Fetch', style: TextStyle(color: Colors.black54)),
+          ] else if (_state == LoadState.loading) ...[
+            Row(children: const [
+              SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+              SizedBox(width: 8),
+              Text('Loading weather...'),
+            ]),
+          ] else if (_state == LoadState.error) ...[
+            Row(children: [
+              const Icon(Icons.error_outline, color: Colors.red),
+              const SizedBox(width: 8),
+              Expanded(child: Text(_errorMessage ?? 'Unknown error', style: const TextStyle(color: Colors.red))),
+              TextButton(onPressed: _fetchWeather, child: const Text('Retry'))
+            ]),
+          ] else if (_state == LoadState.success) ...[
+            // show success summary header
+            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+              const Text('Weather data (timezone: Asia/Dhaka)', style: TextStyle(fontWeight: FontWeight.bold)),
+              TextButton(onPressed: _fetchWeather, child: const Text('Refresh'))
+            ]),
+          ],
+
+          const SizedBox(height: 12),
+
+          // Result area
+          Expanded(
+            child: _state == LoadState.success
+                ? SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _buildCurrentCard(),
+                        const SizedBox(height: 8),
+                        _buildHourlyList(),
+                        const SizedBox(height: 8),
+                        _build10Day(),
+                        const SizedBox(height: 16),
+                      ],
+                    ),
+                  )
+                : Center(
+                    child: _state == LoadState.loading
+                        ? Column(mainAxisSize: MainAxisSize.min, children: const [
+                            CircularProgressIndicator(),
+                            SizedBox(height: 8),
+                            Text('Fetching weather...')
+                          ])
+                        : _state == LoadState.error
+                            ? Column(mainAxisSize: MainAxisSize.min, children: [
+                                const Icon(Icons.error, color: Colors.red, size: 48),
+                                const SizedBox(height: 8),
+                                Text(_errorMessage ?? 'Error'),
+                                const SizedBox(height: 8),
+                                ElevatedButton(onPressed: _fetchWeather, child: const Text('Retry')),
+                              ])
+                            : Column(mainAxisSize: MainAxisSize.min, children: const [
+                                Icon(Icons.cloud, size: 48, color: Colors.blueGrey),
+                                SizedBox(height: 8),
+                                Text('No data yet')
+                              ]),
+                  ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
